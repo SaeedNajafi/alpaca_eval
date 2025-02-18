@@ -1,0 +1,15 @@
+Llama-3-1B-OnlineDPO:
+  completions_kwargs:
+    batch_size: 16
+    max_new_tokens: 4096
+    model_kwargs:
+      dtype: bfloat16
+    model_name: /scratch/ssd004/scratch/snajafi/vector-backup/mmpo-experiments/llama3.2-1b-sftdatasetv3-sft-checkpoint-111000-online-dpo-beta-0.01-lr-5.0e-6/checkpoint-1998_full_model
+    stop_token_ids:
+    - 128001
+    - 128009
+    temperature: 0.9
+    top_p: 1.0
+  fn_completions: vllm_local_completions
+  pretty_name: Llama-3-1B-OnlineDPO
+  prompt_template: Llama-3-1B-OnlineDPO/prompt.txt
