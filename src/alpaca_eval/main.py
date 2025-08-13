@@ -9,9 +9,260 @@ import pandas as pd
 from . import analyze, annotators, constants, decoders, metrics, utils
 from .types import AnyData, AnyLoadableDF, AnyPath
 
+import contextlib
+from filelock import FileLock
+
 CUR_DIR = Path(__file__).parent
 
 __all__ = ["evaluate", "evaluate_from_model", "analyze_evaluators", "make_leaderboard"]
+
+def evaluate(
+    model_outputs: Optional[AnyLoadableDF] = None,
+    reference_outputs: AnyLoadableDF = constants.ALPACAEVAL_REFERENCE_OUTPUTS,
+    annotators_config: AnyPath = constants.DEFAULT_ANNOTATOR_CONFIG,
+    name: Optional[str] = None,
+    output_path: Optional[Union[AnyPath, str]] = "auto",
+    precomputed_leaderboard: Optional[Union[str, AnyPath, AnyData]] = "auto",
+    is_overwrite_leaderboard: bool = False,
+    leaderboard_mode_to_print: Optional[Union[str, Sequence[str]]] = "minimal",
+    current_leaderboard_mode: str = "community",
+    is_return_instead_of_print: bool = False,
+    fn_metric: Union[str, callable] = "get_length_controlled_winrate" if constants.IS_ALPACA_EVAL_2 else "get_winrate",
+    metric_kwargs: Optional[dict[str, Any]] = None,
+    is_recompute_metrics_only: bool = False,
+    sort_by: str = "length_controlled_winrate" if constants.IS_ALPACA_EVAL_2 else "win_rate",
+    is_cache_leaderboard: Optional[bool] = None,
+    max_instances: Optional[int] = None,
+    annotation_kwargs: Optional[dict[str, Any]] = None,
+    Annotator=annotators.PairwiseAnnotator,
+    **annotator_kwargs,
+):
+    """Evaluate a model based on its outputs. This is the default entrypoint if no command is specified.
+
+    Parameters
+    ----------
+    model_outputs : path or data or dict
+        The outputs of the model to add to the leaderboard. Accepts data (list of dictionary, pd.dataframe,
+        datasets.Dataset) or a path to read those (json, csv, tsv) or a function to generate those. Each dictionary
+        (or row of dataframe) should contain the keys that are formatted in the prompts. E.g. by default `instruction`
+        and `output` with optional `input`. If None, we just print the leaderboard.
+
+    reference_outputs : path or data, optional
+        The outputs of the reference model. Same format as `model_outputs`. If None, the reference outputs are a
+        specific set of Davinci 003 outputs on the AlpacaEval set:
+        https://huggingface.co/datasets/tatsu-lab/alpaca_eval.
+
+    annotators_config : path or list of dict, optional
+        The path the (or list of dict of) the annotator's config file. For details see the docstring of
+        `PairwiseAnnotator`.
+
+    name : str, optional
+        The name of the model to add to the leaderboard. If None we check if `generator is in model_outputs` if not
+        we use "Current model".
+
+    output_path : path, optional
+        Path to the directory where the new leaderboard and the annotations should be stored. If None we don't save.
+        If `auto` we use `model_outputs` if it is a path, and otherwise use the directory from which we call the script.
+
+    precomputed_leaderboard : path or data, optional
+        The precomputed leaderboard or a path to it (json, csv, or tsv). The leaderboard should contain at least the
+        column `win_rate`. If `auto` we will try to use the corresponding leaderboard for the reference outputs (only if
+        in CORRESPONDING_OUTPUTS_LEADERBOARDS). If `None` we won't add other models from the leaderboard.
+
+    is_overwrite_leaderboard : bool, optional
+        Whether to overwrite the leaderboard if the model is already in it.
+
+    leaderboard_mode_to_print : {"minimal", "verified", "community", None} or list, optional
+        The mode of the leaderboard to use. Only used if the precomputed leaderboard has a column `mode`, in which case
+        it will filter the leaderboard by this mode. If None keeps all. If a list, will print all the models in the
+        list.
+
+    current_leaderboard_mode : {"minimal", "verified", "community"}, optional
+        The mode of the leaderboard for the current method.
+
+    is_return_instead_of_print : bool, optional
+        Whether to return the metrics instead of printing the results.
+
+    fn_metric : str or callable, optional
+        The function or function name in `metrics` that will be used to convert preference to metrics. The function
+        should take a sequence of dict annotations. Each dict has a preference key (1.5 for draw, 1 for base win,
+        2 when the model to compare wins) and return a dictionary of metrics and the key by which to sort the
+        leaderboard. Common choices: `get_winrate`, `get_length_controlled_winrate`, `get_length_controlled_elo`.
+
+    metric_kwargs : dict, optional
+        Additional arguments to pass to `fn_metric`.
+
+    is_recompute_metrics_only : bool, optional
+        Whether to recompute the metrics. Useful if all you want to recompute the metrics without reannotating.
+
+    sort_by : str, optional
+        The key by which to sort the leaderboard.
+
+    is_cache_leaderboard : bool, optional
+        Whether to save the result leaderboard to `precomputed_leaderboard`. If None we save only if max_instances
+        not None. A preferred way of adding models to the leaderboard is to set `precomputed_leaderboard` to the
+        previously saved leaderboard at `<output_path>/leaderboard.csv`.
+
+    max_instances : int, optional
+        The maximum number of instances to annotate. Useful for testing.
+
+    annotation_kwargs : dict, optional
+        Additional arguments to pass to `PairwiseAnnotator.annotate_head2head`.
+
+    Annotator : class, optional
+        The annotator class to use.
+
+    annotator_kwargs :
+        Additional arguments to pass to `PairwiseAnnotator`.
+    """
+    if (
+        isinstance(current_leaderboard_mode, str)
+        and current_leaderboard_mode not in constants.ORDERED_LEADERBOARD_MODES
+    ):
+        raise ValueError(f"current_leaderboard_mode should be one of {constants.ORDERED_LEADERBOARD_MODES}")
+
+    # All arguments that are expensive to load are functions that will be called inside the lock.
+    args = locals()
+
+    # ## THREAD-SAFETY: We need the output path to create the lock. We determine it outside the main logic.
+    # We use a temporary variable for model_outputs because it might be a dataframe that we don't want to load yet.
+    arg_model_outputs_for_path = args.get("model_outputs")
+    name_for_path = args.get("name")
+    annotators_config_for_path = args.get("annotators_config")
+    # In case `name` is not provided, we need to infer it to get a unique path, without loading the whole dataframe.
+    if arg_model_outputs_for_path is not None and name_for_path is None:
+        if isinstance(arg_model_outputs_for_path, list) and len(arg_model_outputs_for_path) > 0 and "generator" in arg_model_outputs_for_path[0]:
+            name_for_path = arg_model_outputs_for_path[0]["generator"]
+        elif isinstance(arg_model_outputs_for_path, (str, Path)) and Path(arg_model_outputs_for_path).exists():
+            # a bit of a hack to get the name from the path
+            name_for_path = Path(arg_model_outputs_for_path).stem
+    
+    # This is the directory where all results for a given model will be stored.
+    # It's unique per model, so locking it will only serialize evaluations of the same model.
+    output_path = utils.get_output_path(
+        args.get("output_path"),
+        arg_model_outputs_for_path,
+        name_for_path,
+        annotators_config=annotators_config_for_path,
+    )
+    
+    ## THREAD-SAFETY: Define a lock file within the model's output directory.
+    # If no output path is specified, no files will be written, so no lock is needed.
+    if output_path:
+        output_path.mkdir(parents=True, exist_ok=True)
+        # The timeout ensures a process doesn't wait forever if the lock is held by a dead process.
+        lock = FileLock(output_path / ".alpaca_eval.lock", timeout=3600)  # 10-minute timeout
+    else:
+        lock = contextlib.nullcontext()
+
+    ## THREAD-SAFETY: The main logic is wrapped in the lock's context.
+    # This ensures that all file operations (reading/writing annotations and leaderboards)
+    # for a specific model are atomic and protected from race conditions.
+    with lock:
+        logging.info(f"Running evaluation for model: {name_for_path or 'current model'}. Lock acquired.")
+        
+        # Now we can safely execute the original function logic
+        leaderboard, precomputed_leaderboard = utils.get_precomputed_leaderboard(
+            precomputed_leaderboard, reference_outputs, annotators_config
+        )
+        annotations = None
+    
+        arg_model_outputs = model_outputs
+        if model_outputs is not None:
+            model_outputs = utils.load_or_convert_to_dataframe(model_outputs)
+            reference_outputs = utils.load_or_convert_to_dataframe(reference_outputs)
+            name = utils.get_generator_name(name, model_outputs)
+    
+            if (name not in leaderboard) or is_overwrite_leaderboard or is_recompute_metrics_only:
+                logging.info(f"Evaluating the {name} outputs.")
+    
+                if not is_recompute_metrics_only:
+                    leaderboard[name] = {}
+                    if max_instances is not None:
+                        # first we shuffle both outputs with a fix seed => more representative
+                        if len(model_outputs) != len(reference_outputs):
+                            logging.warning(
+                                "model_outputs and reference_outputs have different lengths, so we cannot shuffle before taking the first max_instances."
+                            )
+                        else:
+                            seed = 123
+                            model_outputs = model_outputs.sample(frac=1, random_state=seed)
+                            reference_outputs = reference_outputs.sample(frac=1, random_state=seed)
+    
+                        model_outputs = model_outputs[:max_instances]
+                        reference_outputs = reference_outputs[:max_instances]
+    
+                    annotator = Annotator(annotators_config=annotators_config, **annotator_kwargs)
+                    annotations = annotator.annotate_head2head(
+                        outputs_1=reference_outputs, outputs_2=model_outputs, **(annotation_kwargs or {})
+                    )
+    
+                    leaderboard[name]["mode"] = current_leaderboard_mode
+                    leaderboard[name]["avg_length"] = int(model_outputs["output"].str.len().mean())
+    
+                else:
+                    # load previously computed annotations so that we can recompute metrics
+                    assert output_path is not None and name in leaderboard
+                    annotations = pd.read_json(output_path / "annotations.json")
+    
+                if isinstance(fn_metric, str):
+                    fn_metric_ = getattr(metrics, fn_metric)
+                else:
+                    fn_metric_ = fn_metric
+    
+                leaderboard[name].update(fn_metric_(annotations, **(metric_kwargs or {})))
+    
+            else:
+                logging.info(f"Skipping evaluation of {name} as it is already in the precomputed leaderboard.")
+    
+        df_leaderboard = pd.DataFrame.from_dict(leaderboard, orient="index").sort_values(by=sort_by, ascending=False)
+        df_leaderboard = df_leaderboard[
+            utils.prioritize_elements(list(df_leaderboard.columns), ["win_rate", "standard_error"])
+        ]
+    
+        if output_path is not None:
+            logging.info(f"Saving all results to {output_path}")
+            df_leaderboard.to_csv(output_path / "leaderboard.csv")
+            if annotations is not None:
+                utils.convert_to_dataframe(annotations).to_json(
+                    output_path / "annotations.json", orient="records", indent=2
+                )
+    
+        if is_cache_leaderboard is None:
+            is_cache_leaderboard = max_instances is None
+    
+        if is_cache_leaderboard:
+            if isinstance(precomputed_leaderboard, AnyPath):
+                logging.info(f"Saving result to the precomputed leaderboard at {precomputed_leaderboard}")
+                # This write operation is now safe because the lock is held for the entire read-modify-write cycle.
+                df_leaderboard.to_csv(precomputed_leaderboard)
+            else:
+                logging.info(
+                    f"Not saving the result to the cached leaderboard because precomputed_leaderboard is not a "
+                    f"path but {type(precomputed_leaderboard)}."
+                )
+
+    # The lock is automatically released when exiting the 'with' block.
+    # The rest of the function (printing) does not involve file I/O and is safe to run outside the lock.
+    
+    # We need to re-fetch name in case it was determined inside the lock
+    if 'name' not in locals() and 'df_leaderboard' in locals():
+        name = df_leaderboard.index[-1] if not df_leaderboard.empty else None
+
+    if is_return_instead_of_print:
+        return df_leaderboard, annotations
+    else:
+        # df_leaderboard might not be defined if model_outputs is None and we only print
+        if 'df_leaderboard' not in locals():
+             df_leaderboard, _ = utils.get_precomputed_leaderboard(
+                precomputed_leaderboard, reference_outputs, annotators_config
+             )
+        utils.print_leaderboard(
+            df_leaderboard,
+            leaderboard_mode_to_print,
+            current_name=name,
+            cols_to_print=[sort_by, "win_rate", "standard_error", "n_total", "avg_length"],
+        )
 
 
 def evaluate(

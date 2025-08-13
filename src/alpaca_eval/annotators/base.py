@@ -1,4 +1,6 @@
+## PROCESS-SAFETY: Import FileLock for process-safe file locking and os for atomic writes.
 import abc
+import ast
 import json
 import logging
 import os
@@ -7,11 +9,10 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence, Type, Union
 
-import numpy as np
 import pandas as pd
+from filelock import FileLock
 
 import alpaca_eval
-
 from .. import completion_parsers, constants, processors, types, utils
 from ..decoders import get_fn_completions
 
@@ -410,7 +411,10 @@ class BaseAnnotator(abc.ABC):
             df_annotations = self.df_annotations
         else:
             # temorarily remove missing annotations from self.df_annotations
-            df_annotations = self.df_annotations.query(f"{self.annotation_key} != {self.TMP_MISSING_ANNOTATION}")
+            if self.df_annotations is None:
+                df_annotations = None
+            else:
+                df_annotations = self.df_annotations.query(f"{self.annotation_key} != {self.TMP_MISSING_ANNOTATION}")
 
         kwargs = {}
         if self.is_reapply_parsing:
@@ -421,7 +425,7 @@ class BaseAnnotator(abc.ABC):
         return df_to_annotate
 
     def _store_annotations_(self, df_annotated: pd.DataFrame):
-        """Store annotation in memory and on disk"""
+        """Store annotation in memory"""
 
         if self.df_annotations is None:
             df_annotations = df_annotated
@@ -507,22 +511,30 @@ class BaseAnnotatorJSON(BaseAnnotator):
 
     def __init__(self, *args, caching_path: Optional[types.AnyPath] = "auto", **kwargs):
         super().__init__(*args, **kwargs)
-        self.caching_path = self._initialize_cache(caching_path)
+        self.caching_path, self._caching_lock = self._initialize_cache(caching_path)
 
     def save(self, path: Optional[types.AnyPath] = None):
-        """Save all annotations to json."""
-
+        """Save all annotations to json. This method is now process-safe."""
         path = path or self.caching_path
         if path is not None:
+            ## PROCESS-SAFETY: This method should be called within a lock.
             logging.info(f"Saving all annotations to {path}.")
-            # to make sure that we don't overwrite the annotations we load again from file (ideally would use a DB)
+            # to make sure that we don't overwrite the annotations we load again from file
             self._refresh_annotations_()
-            if not self.is_store_missing_annotations:
+            if not self.is_store_missing_annotations and self.df_annotations is not None:
                 self.df_annotations = self.df_annotations[~self.df_annotations[self.annotation_key].isna()]
-            self.df_annotations.to_json(path, orient="records", indent=2)
+
+            if self.df_annotations is not None and not self.df_annotations.empty:
+                # Use a temporary file for atomic write to prevent corruption if the process dies mid-write
+                temp_path = path.with_suffix(path.suffix + ".tmp")
+                self.df_annotations.to_json(temp_path, orient="records", indent=2)
+                os.replace(temp_path, path)
 
     def load_(self, path: Optional[types.AnyPath] = None):
-        """Load all the annotations from json."""
+        """Load all the annotations from json.
+        
+        PROCESS-SAFETY: This method should be called within a lock context.
+        """
         path = path or self.caching_path
         if path is not None:
             path = Path(path)
@@ -535,29 +547,68 @@ class BaseAnnotatorJSON(BaseAnnotator):
             if isinstance(self.annotators_config, (str, Path, os.PathLike)):
                 stem = Path(self.annotators_config).stem
                 caching_path = Path(self.annotators_config).parent / f"annotations_seed{self.seed}_{stem}.json"
-                logging.info(f"Saving annotations to `{caching_path}`.")
+                logging.info(f"Annotations will be cached at `{caching_path}`.")
             else:
-                logging.warning("caching_path cannot be 'auto' if annotators_config is not a path. Setting to None.")
+                logging.warning("caching_path cannot be 'auto' if annotators_config is not a path. Caching is disabled.")
                 caching_path = None
         elif caching_path is not None:
-            logging.warning("Saving_path is given but not 'auto', make sure that it's different for different seeds.")
+            logging.warning("caching_path is given but not 'auto', make sure that it's different for different seeds.")
 
+        caching_lock = None
         if caching_path is not None:
-            self.load_(caching_path)
+            caching_path = Path(caching_path)
+            caching_path.parent.mkdir(parents=True, exist_ok=True)
 
-        return caching_path
+            ## PROCESS-SAFETY: Define a lock file next to the cache file.
+            lock_path = caching_path.with_suffix(caching_path.suffix + ".lock")
+            caching_lock = FileLock(lock_path, timeout=600)
+
+            ## PROCESS-SAFETY: Acquire lock before the initial load to ensure a clean read.
+            with caching_lock:
+                self.load_(caching_path)
+
+        return caching_path, caching_lock
 
     def _store_annotations_(self, df_annotated_to_store: pd.DataFrame):
-        super()._store_annotations_(df_annotated_to_store)
-        self.save()
+        ## PROCESS-SAFETY: Overriding to make the entire read-modify-write cycle atomic.
+        if self.caching_path is None or self._caching_lock is None:
+            # If no cache, just update in-memory
+            super()._store_annotations_(df_annotated_to_store)
+            return
+
+        ## PROCESS-SAFETY: Acquire lock for the entire duration of updating and saving annotations.
+        with self._caching_lock:
+            # 1. Refresh in-memory annotations from the file to get the latest state
+            self._refresh_annotations_()
+
+            # 2. Merge the new annotations into the in-memory dataframe
+            if self.df_annotations is None:
+                df_annotations = df_annotated_to_store
+            else:
+                df_annotations = pd.concat([self.df_annotations, df_annotated_to_store], axis=0, ignore_index=True)
+            self.df_annotations = df_annotations.drop_duplicates(subset=self.all_keys, keep="last")
+
+            # 3. Save the completely merged dataframe back to the file. The save method is now safe
+            # because it operates within this lock.
+            self.save()
 
     def _refresh_annotations_(self):
-        """Refresh the annotations in memory."""
-        curr_df_annotations = self.df_annotations.copy()
-        self.load_()
-        self.df_annotations = pd.concat(
-            [self.df_annotations, curr_df_annotations], axis=0, ignore_index=True
-        ).drop_duplicates(subset=self.all_keys, keep="last")
+        """Refresh the annotations in memory from the file.
+
+        ## PROCESS-SAFETY: This method should only be called within a lock context.
+        """
+        curr_df_annotations = self.df_annotations.copy() if self.df_annotations is not None else pd.DataFrame()
+        self.df_annotations = None  # Reset before loading
+        self.load_()  # Load the latest from disk
+
+        if self.df_annotations is None:
+            self.df_annotations = pd.DataFrame()
+
+        # Merge the disk version with the version from the current process run
+        if not curr_df_annotations.empty:
+            self.df_annotations = pd.concat(
+                [self.df_annotations, curr_df_annotations], axis=0, ignore_index=True
+            ).drop_duplicates(subset=self.all_keys, keep="last")
 
 
 class SingleAnnotator:
@@ -734,7 +785,7 @@ class SingleAnnotator:
         if self.completion_column in df_to_annotate.columns:
             if not df_to_annotate.empty:
                 df_to_annotate[self.completion_column] = completions[self.completion_key]  # only works for bs 1
-            main_df_to_annotate[idx_not_completed] = df_to_annotate  # puts back all the new completions
+            main_df_to_annotate.loc[idx_not_completed, df_to_annotate.columns] = df_to_annotate  # puts back all the new completions
             df_to_annotate = main_df_to_annotate
             completions_to_parse = df_to_annotate[self.completion_column]
         else:
@@ -827,7 +878,7 @@ class SingleAnnotator:
                     batch_annotations = [None] * self.batch_size
 
             except Exception as e:
-                logging.exception(f"Error while parsing completion: '''\n{completion}\n'''")
+                logging.warning(f"Error while parsing completion: '''\n{completion}\n'''. Error: {e}")
                 batch_annotations = [None] * self.batch_size
 
             all_annotations += batch_annotations
@@ -844,7 +895,8 @@ class SingleAnnotator:
                 f"{arr_is_na.sum().item()} samples had no auto annotation. We are filtering them for now. "
                 f"If you are using chain of thought it might be that max_tokens limit is too low. "
             )
-            df_annotated = df_annotated[~arr_is_na]
+            # We don't filter anymore, just keep as NA
+            # df_annotated = df_annotated[~arr_is_na]
 
         for processor in self.processors[::-1]:  # postprocess in reverted order => no interactions between processors
             df_annotated = processor.postprocess(df_annotated)

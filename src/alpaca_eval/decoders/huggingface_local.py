@@ -125,7 +125,10 @@ def huggingface_local_completions(
         batch_size=batch_size,
     )
     default_kwargs.update(kwargs)
+    default_kwargs["use_cache"] = True
     logging.info(f"Kwargs to completion: {default_kwargs}")
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
     pipeline = transformers.pipeline(
         task="text-generation",
         model=model,
