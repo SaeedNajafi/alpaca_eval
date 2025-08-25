@@ -1,0 +1,14 @@
+llama3.2-1b-offline-mmpo-beta_0.5-lr_0.0005-reward_eps_0.9-avg_logps_no-v13-no-entropy_checkpoint-3060:
+  completions_kwargs:
+    batch_size: 2
+    max_new_tokens: 512
+    model_name: /home/saeednjf/projects/def-afyshe-ab/saeednjf/checkpoints/llama-3.2-1b-mmpo-v13/llama3.2-1b-offline-mmpo-beta_0.5-lr_0.0005-reward_eps_0.9-avg_logps_no-v13-no-entropy/checkpoint-3060
+    model_kwargs:
+      torch_dtype: bfloat16
+    eos_token_id:
+    - 128001
+    temperature: 0.01
+    top_p: 0.95
+  fn_completions: huggingface_local_completions
+  pretty_name: llama3.2-1b-offline-mmpo-beta_0.5-lr_0.0005-reward_eps_0.9-avg_logps_no-v13-no-entropy_checkpoint-3060
+  prompt_template: llama3.2-1b-offline-mmpo-beta_0.5-lr_0.0005-reward_eps_0.9-avg_logps_no-v13-no-entropy_checkpoint-3060/prompt.txt

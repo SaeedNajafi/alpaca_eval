@@ -1,0 +1,15 @@
+smollm2-360M-orca_bin_ultra-offline-dpo-beta_1.0-lr_0.00005-avg_logps_no-v3_checkpoint-2870:
+  completions_kwargs:
+    batch_size: 8
+    max_new_tokens: 512
+    model_name: /home/saeednjf/projects/def-afyshe-ab/saeednjf/checkpoints/smollm2/v3-runs/smollm2-360M-orca_bin_ultra-offline-dpo-beta_1.0-lr_0.00005-avg_logps_no-v3/checkpoint-2870
+    model_kwargs:
+      torch_dtype: bfloat16
+    eos_token_id:
+    - 0
+    - 2
+    temperature: 0.01
+    top_p: 0.95
+  fn_completions: huggingface_local_completions
+  pretty_name: smollm2-360M-orca_bin_ultra-offline-dpo-beta_1.0-lr_0.00005-avg_logps_no-v3_checkpoint-2870
+  prompt_template: smollm2-360M-orca_bin_ultra-offline-dpo-beta_1.0-lr_0.00005-avg_logps_no-v3_checkpoint-2870/prompt.txt

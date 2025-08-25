@@ -8,14 +8,13 @@ from textwrap import dedent
 YAML_TEMPLATE = dedent("""
     model_name:
       completions_kwargs:
-        batch_size: 8
+        batch_size: 2
         max_new_tokens: 512
         model_name: dummy model path
         model_kwargs:
           torch_dtype: 'bfloat16'
         eos_token_id:
-        - 0
-        - 2
+        - 128001
         temperature: 0.01
         top_p: 0.95
       fn_completions: huggingface_local_completions

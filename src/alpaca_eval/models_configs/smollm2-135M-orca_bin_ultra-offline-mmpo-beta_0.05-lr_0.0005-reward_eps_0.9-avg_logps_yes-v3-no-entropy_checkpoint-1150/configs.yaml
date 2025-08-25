@@ -1,0 +1,15 @@
+smollm2-135M-orca_bin_ultra-offline-mmpo-beta_0.05-lr_0.0005-reward_eps_0.9-avg_logps_yes-v3-no-entropy_checkpoint-1150:
+  completions_kwargs:
+    batch_size: 8
+    max_new_tokens: 512
+    model_name: /home/saeednjf/projects/def-afyshe-ab/saeednjf/checkpoints/smollm2/v3-runs/smollm2-135M-orca_bin_ultra-offline-mmpo-beta_0.05-lr_0.0005-reward_eps_0.9-avg_logps_yes-v3-no-entropy/checkpoint-1150
+    model_kwargs:
+      torch_dtype: bfloat16
+    eos_token_id:
+    - 0
+    - 2
+    temperature: 0.01
+    top_p: 0.95
+  fn_completions: huggingface_local_completions
+  pretty_name: smollm2-135M-orca_bin_ultra-offline-mmpo-beta_0.05-lr_0.0005-reward_eps_0.9-avg_logps_yes-v3-no-entropy_checkpoint-1150
+  prompt_template: smollm2-135M-orca_bin_ultra-offline-mmpo-beta_0.05-lr_0.0005-reward_eps_0.9-avg_logps_yes-v3-no-entropy_checkpoint-1150/prompt.txt

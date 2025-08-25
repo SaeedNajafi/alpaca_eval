@@ -1,0 +1,14 @@
+llama-3.2-1b-sft:
+  completions_kwargs:
+    batch_size: 2
+    max_new_tokens: 512
+    model_name: /home/saeednjf/projects/def-afyshe-ab/saeednjf/llama3.2-1b-sftdatasetv3-sft-checkpoint-111000
+    model_kwargs:
+      torch_dtype: bfloat16
+    eos_token_id:
+    - 128001
+    temperature: 0.01
+    top_p: 0.95
+  fn_completions: huggingface_local_completions
+  pretty_name: llama-3.2-1b-sft
+  prompt_template: llama-3.2-1b-sft/prompt.txt
